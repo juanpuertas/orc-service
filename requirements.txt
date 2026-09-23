@@ -6,3 +6,4 @@ paddlepaddle==2.6.2
 opencv-python-headless
 openai
 numpy
+pymupdf

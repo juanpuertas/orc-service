@@ -9,6 +9,7 @@ import json
 import base64
 import os
 from openai import OpenAI
+import fitz  # PyMuPDF - para leer PDFs
 
 app = FastAPI(title="Servicio OCR de Facturas")
 
@@ -26,6 +27,7 @@ ocr = PaddleOCR(use_angle_cls=True, lang='es')
 
 class InvoiceRequest(BaseModel):
     imageBase64: str
+    fileType: str = "image"  # "image" o "pdf"
     prompt: str = None
     apiKey: str = None
 
@@ -42,16 +44,38 @@ def organizar_texto_ocr(resultados_ocr):
     texto_completo = "\n".join([item['texto'] for item in lineas])
     return texto_completo
 
+def pdf_primera_pagina_a_imagen(pdf_bytes: bytes) -> np.ndarray:
+    """Convierte la primera página de un PDF en un array numpy (BGR) para PaddleOCR."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.page_count == 0:
+        raise ValueError("El PDF no contiene páginas")
+    
+    pagina = doc[0]  # Solo primera página
+    # DPI 200 ofrece buena calidad sin ser demasiado pesado
+    mat = fitz.Matrix(200 / 72, 200 / 72)
+    pixmap = pagina.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+    img_array = np.frombuffer(pixmap.samples, dtype=np.uint8)
+    img = img_array.reshape(pixmap.height, pixmap.width, 3)
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    doc.close()
+    return img_bgr
+
 @app.post("/api/scan-invoice")
 async def scan_invoice(req: InvoiceRequest):
     try:
-        # A. Leer la imagen desde el Base64 que envía Next.js
-        image_data = base64.b64decode(req.imageBase64)
-        nparr = np.frombuffer(image_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+        # A. Decodificar el archivo Base64 (imagen o PDF)
+        file_data = base64.b64decode(req.imageBase64)
+
+        if req.fileType == "pdf":
+            # Convertir primera página del PDF a imagen
+            img = pdf_primera_pagina_a_imagen(file_data)
+        else:
+            # Procesar como imagen normal
+            nparr = np.frombuffer(file_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
         if img is None:
-            raise HTTPException(status_code=400, detail="Imagen no válida")
+            raise HTTPException(status_code=400, detail="Archivo no válido o no se pudo decodificar")
 
         # B. Extraer texto con PaddleOCR
         result = ocr.ocr(img, cls=True)
