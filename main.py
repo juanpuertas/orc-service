@@ -1,9 +1,18 @@
 """Servicio OCR de facturas (contrato C-04 del cerebro, mejora CDC-F-026).
 
-Flujo: archivo (imagen o PDF) -> texto (capa de texto del PDF o PaddleOCR) -> DeepSeek -> JSON.
+Flujo:
+  - PDF digital (con capa de texto)  -> texto del PDF -> DeepSeek -> JSON            (meta.source = "pdf-text")
+  - Foto o PDF escaneado             -> imagen a DeepSeek (visión) -> JSON           (meta.source = "vision")
+      si DeepSeek con imagen falla   -> PaddleOCR -> texto -> DeepSeek -> JSON       (meta.source = "ocr")
+  En la prueba con 5 facturas reales (2026-11-03) la imagen acertó 25/25 en 3 corridas, en ~2 s, frente a 24/25 y
+  10-40 s con PaddleOCR (el OCR no lee letra manuscrita). PaddleOCR queda de respaldo.
 
 Variables de entorno (todas opcionales salvo DEEPSEEK_API_KEY):
   DEEPSEEK_API_KEY        clave de DeepSeek si el request no trae apiKey
+  LLM_MODEL               modelo de DeepSeek (por defecto deepseek-flash; acepta imágenes)
+  OCR_USE_VISION          "true"/"false": enviar la imagen a DeepSeek en lugar de pasarla por OCR (por defecto true)
+  VISION_MAX_SIDE         lado máximo de la imagen enviada a DeepSeek (por defecto 2000)
+  VISION_TIMEOUT_SECONDS  tiempo máximo de la llamada con imagen antes de pasar al OCR de respaldo (por defecto 30)
   OCR_INTERNAL_TOKEN      si está definido, se exige "Authorization: Bearer <token>" (el mismo valor en el .env de Next)
   OCR_ALLOWED_ORIGINS     orígenes CORS separados por coma (vacío = sin CORS; Next llama desde el servidor)
   OCR_DET_LIMIT_SIDE_LEN  lado máximo para la detección de texto (por defecto 960; 1280 midió ~1,5 s más por foto)
@@ -60,6 +69,13 @@ INTERNAL_TOKEN = os.getenv("OCR_INTERNAL_TOKEN", "").strip()
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("OCR_ALLOWED_ORIGINS", "").split(",") if o.strip()]
 PDF_DPI = env_int("PDF_DPI", 200)
 LLM_TIMEOUT = env_int("LLM_TIMEOUT_SECONDS", 60)
+LLM_MODEL = os.getenv("LLM_MODEL", "").strip() or "deepseek-flash"
+USE_VISION = env_bool("OCR_USE_VISION", True)
+VISION_MAX_SIDE = env_int("VISION_MAX_SIDE", 2000)
+VISION_TIMEOUT = env_int("VISION_TIMEOUT_SECONDS", 30)
+# Con imagen, deepseek-flash "razona" por defecto: gastaba los 1500 tokens pensando y devolvía el JSON vacío.
+# Apagado responde directo (~200 tokens de salida, ~2 s). Se aplica también al texto por coherencia.
+NO_THINKING = {"thinking": {"type": "disabled"}}
 MIN_PDF_TEXT_CHARS = 40  # menos que esto = PDF escaneado (imagen): se pasa por OCR
 
 app = FastAPI(title="Servicio OCR de Facturas")
@@ -169,6 +185,41 @@ def pdf_primera_pagina_a_imagen(doc: "fitz.Document") -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
+def imagen_a_data_url(img: np.ndarray) -> str:
+    """JPEG en base64 (data URL) con el lado mayor limitado a VISION_MAX_SIDE, para enviarlo a DeepSeek."""
+    h, w = img.shape[:2]
+    escala = min(1.0, VISION_MAX_SIDE / max(h, w))
+    if escala < 1:
+        img = cv2.resize(img, (int(w * escala), int(h * escala)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise ValueError("No se pudo codificar la imagen")
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
+
+
+def consultar_ia(api_key: str, instrucciones: str, contenido, timeout: Optional[int] = None):
+    """Llama a DeepSeek y devuelve (datos, usage). `contenido` es texto o una lista con la imagen (visión)."""
+    client = get_llm_client(api_key)
+    if timeout:
+        client = client.with_options(timeout=timeout, max_retries=0)
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": f"You are a helpful assistant that strictly outputs JSON.\n\n{instrucciones}"},
+            {"role": "user", "content": contenido},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.0,
+        max_tokens=1500,
+        extra_body=NO_THINKING,
+    )
+    contenido_respuesta = response.choices[0].message.content or ""
+    datos = json.loads(contenido_respuesta)
+    if not isinstance(datos, dict):
+        raise json.JSONDecodeError("La respuesta no es un objeto JSON", contenido_respuesta, 0)
+    return datos, getattr(response, "usage", None)
+
+
 def check_token(authorization: Optional[str]) -> None:
     if not INTERNAL_TOKEN:
         return  # sin token configurado se acepta como antes (compatibilidad con C-04 v1)
@@ -236,62 +287,73 @@ def scan_invoice(req: InvoiceRequest, authorization: Optional[str] = Header(defa
         raise HTTPException(status_code=400, detail="Archivo no válido o no se pudo decodificar")
     timings["decode"] = round(time.perf_counter() - t0, 3)
 
-    # B. OCR (solo si no había texto digital)
-    if source == "ocr":
-        t0 = time.perf_counter()
-        try:
-            with ocr_lock:
-                timings["ocrWait"] = round(time.perf_counter() - t0, 3)
-                t1 = time.perf_counter()
-                result = ocr.ocr(img, cls=True)
-                timings["ocr"] = round(time.perf_counter() - t1, 3)
-        except Exception:
-            log.exception("Error en PaddleOCR")
-            raise HTTPException(status_code=500, detail="Error al leer el texto de la factura")
-        texto_crudo = organizar_texto_ocr(result)
-
-    if not texto_crudo.strip():
-        raise HTTPException(status_code=422, detail="No se encontró texto en la factura")
-    log.info("Texto listo source=%s timings=%s chars=%d", source, timings, len(texto_crudo))
-
-    # C. Interpretar con DeepSeek. El prompt (instrucciones + ejemplos) va primero y fijo para aprovechar
-    #    el caché de contexto de DeepSeek; el texto de la factura va al final.
     api_key = req.apiKey or os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="Servicio OCR sin clave de DeepSeek configurada")
+    # El prompt (instrucciones + ejemplos) va primero y fijo para aprovechar el caché de contexto de DeepSeek;
+    # la factura (imagen o texto) va al final.
     instrucciones = req.prompt or DEFAULT_PROMPT
+    datos_extraidos = None
+    usage = None
 
-    t0 = time.perf_counter()
-    try:
-        response = get_llm_client(api_key).chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": f"You are a helpful assistant that strictly outputs JSON.\n\n{instrucciones}"},
-                {"role": "user", "content": f"Texto OCR a procesar:\n{texto_crudo}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=1500,
-        )
-        datos_extraidos = json.loads(response.choices[0].message.content)
-    except json.JSONDecodeError:
-        log.exception("DeepSeek no devolvió JSON válido")
-        raise HTTPException(status_code=502, detail="La IA no devolvió un JSON válido")
-    except Exception:
-        log.exception("Error al consultar DeepSeek")
-        raise HTTPException(status_code=502, detail="Error al consultar el servicio de IA")
-    timings["llm"] = round(time.perf_counter() - t0, 3)
+    # B. Foto o PDF escaneado: la imagen va directo a DeepSeek. Si falla, se sigue con PaddleOCR (paso C).
+    if source == "ocr" and USE_VISION:
+        t0 = time.perf_counter()
+        try:
+            contenido = [
+                {"type": "image_url", "image_url": {"url": imagen_a_data_url(img)}},
+                {"type": "text", "text": "Extrae los datos de esta factura (imagen adjunta)."},
+            ]
+            datos_extraidos, usage = consultar_ia(api_key, instrucciones, contenido, timeout=VISION_TIMEOUT)
+            source = "vision"
+        except Exception as e:
+            # Respaldo: sin detalles de la clave ni del contenido en el log, solo el tipo de error
+            log.warning("DeepSeek con imagen falló (%s); se usa PaddleOCR de respaldo", type(e).__name__)
+            timings["visionFailed"] = True
+        timings["vision"] = round(time.perf_counter() - t0, 3)
+
+    # C. OCR + texto: PDF digital (ya tiene texto) o respaldo cuando la imagen no funcionó / está desactivada
+    if datos_extraidos is None:
+        if source == "ocr":
+            t0 = time.perf_counter()
+            try:
+                with ocr_lock:
+                    timings["ocrWait"] = round(time.perf_counter() - t0, 3)
+                    t1 = time.perf_counter()
+                    result = ocr.ocr(img, cls=True)
+                    timings["ocr"] = round(time.perf_counter() - t1, 3)
+            except Exception:
+                log.exception("Error en PaddleOCR")
+                raise HTTPException(status_code=500, detail="Error al leer el texto de la factura")
+            texto_crudo = organizar_texto_ocr(result)
+
+        if not texto_crudo.strip():
+            raise HTTPException(status_code=422, detail="No se encontró texto en la factura")
+        log.info("Texto listo source=%s timings=%s chars=%d", source, timings, len(texto_crudo))
+
+        t0 = time.perf_counter()
+        try:
+            datos_extraidos, usage = consultar_ia(api_key, instrucciones, f"Texto OCR a procesar:\n{texto_crudo}")
+        except json.JSONDecodeError:
+            log.exception("DeepSeek no devolvió JSON válido")
+            raise HTTPException(status_code=502, detail="La IA no devolvió un JSON válido")
+        except Exception:
+            log.exception("Error al consultar DeepSeek")
+            raise HTTPException(status_code=502, detail="Error al consultar el servicio de IA")
+        timings["llm"] = round(time.perf_counter() - t0, 3)
+
     timings["total"] = round(time.perf_counter() - t_total, 3)
-
-    usage = getattr(response, "usage", None)
-    log.info("Factura procesada source=%s timings=%s tokens=%s", source, timings,
-             getattr(usage, "total_tokens", None) if usage else None)
+    tokens = None
+    if usage:
+        tokens = {"in": getattr(usage, "prompt_tokens", None), "out": getattr(usage, "completion_tokens", None),
+                  "cacheHit": getattr(usage, "prompt_cache_hit_tokens", None)}
+    log.info("Factura procesada source=%s model=%s timings=%s tokens=%s", source, LLM_MODEL, timings, tokens)
 
     return {
         "success": True,
         "data": datos_extraidos,
-        # Campos agregados en CDC-F-026 (opcionales para el consumidor)
-        "meta": {"source": source, "timings": timings, "ocrText": texto_crudo},
+        # Campos agregados en CDC-F-026 (opcionales para el consumidor). Con "vision" no hay texto OCR: ocrText = "".
+        "meta": {"source": source, "timings": timings, "ocrText": texto_crudo, "tokens": tokens},
     }
 
 
