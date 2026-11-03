@@ -9,3 +9,12 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    # Red interna compartida con Next (as-centrodecompras-app), que llama a http://ocr-service:8000.
+    # La crea/usa deploy.sh de as-centrodecompras. Sin esto, cada "docker compose up" recrea el
+    # contenedor fuera de esa red y Next responde "fetch failed".
+    networks:
+      - appnet
+
+networks:
+  appnet:
+    external: true   # ya existe en el VPS; en otra PC crearla una vez: docker network create appnet
