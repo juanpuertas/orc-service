@@ -18,6 +18,11 @@ COPY requirements.txt .
 # Instalar dependencias de Python
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Descargar los modelos de PaddleOCR al construir la imagen (CDC-F-026). Antes se bajaban en cada arranque
+# del contenedor: cada reinicio tardaba más y fallaba si no había conexión a los servidores de Paddle.
+COPY download_models.py .
+RUN python download_models.py
+
 # Copiar el resto del código
 COPY . .
 
